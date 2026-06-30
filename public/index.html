@@ -318,6 +318,77 @@
 
   .room-spacer { flex: 1; }
 
+  .btn-mic {
+    width: 38px; height: 38px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 9px;
+    font-size: 1.05rem;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s, box-shadow 0.15s;
+    flex-shrink: 0;
+  }
+  .btn-mic:hover { border-color: var(--muted); }
+  .btn-mic.live {
+    background: rgba(107,207,142,0.12);
+    border-color: var(--green);
+    color: var(--green);
+  }
+  .btn-mic.live.muted {
+    background: rgba(243,114,114,0.1);
+    border-color: #f37272;
+    color: #f37272;
+  }
+  .btn-mic.live.speaking {
+    box-shadow: 0 0 0 3px rgba(107,207,142,0.35);
+  }
+
+  .voice-strip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 2px;
+  }
+  .voice-avatar-wrap {
+    position: relative;
+    width: 30px; height: 30px;
+    flex-shrink: 0;
+  }
+  .voice-avatar {
+    width: 100%; height: 100%;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.68rem; font-weight: 800; color: #11110f;
+    border: 2px solid var(--bg);
+    transition: box-shadow 0.15s;
+  }
+  .voice-avatar-wrap.speaking .voice-avatar {
+    box-shadow: 0 0 0 2px var(--green), 0 0 10px rgba(107,207,142,0.6);
+  }
+  .voice-mute-badge {
+    position: absolute;
+    bottom: -2px; right: -2px;
+    width: 14px; height: 14px;
+    background: #f37272;
+    border-radius: 50%;
+    display: none;
+    align-items: center; justify-content: center;
+    font-size: 0.5rem;
+    border: 2px solid var(--surface);
+  }
+  .voice-avatar-wrap.muted .voice-mute-badge { display: flex; }
+
+  .person-mic-icon {
+    font-size: 0.85rem;
+    color: var(--muted-dim);
+    flex-shrink: 0;
+  }
+  .person-mic-icon.live { color: var(--green); }
+  .person-mic-icon.muted { color: #f37272; }
+  .person-row.speaking { border-color: var(--green); }
+
   .btn-invite {
     background: var(--surface2);
     border: 1px solid var(--border);
@@ -598,7 +669,9 @@
       </div>
     </div>
     <div class="room-code-pill mono" id="room-code-pill" onclick="copyCode()">------</div>
+    <div class="voice-strip" id="voice-strip"></div>
     <div class="room-spacer"></div>
+    <button class="btn-mic" id="mic-btn" onclick="toggleVoice()" title="Join voice chat">🎤</button>
     <button class="btn btn-invite" onclick="copyCode()">🔗 Invite</button>
   </div>
 
@@ -655,6 +728,21 @@ const QUICK_EMOJIS = ['❤️','😂','🔥','👍','🎉','😮'];
 
 let ws = null, myId = null, myName = '', myColor = '', roomId = null, isHost = false;
 let player = null, ytReady = false, pendingState = null, ignoreSeek = false;
+let latestUsers = [];
+
+// Voice chat state
+let inVoice = false, micMuted = false;
+let localStream = null;
+const peerConnections = {}; // userId -> RTCPeerConnection
+const remoteAudioEls = {}; // userId -> <audio>
+let audioCtx = null, analyser = null, speakingInterval = null;
+
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
+  ]
+};
 
 /* ───── LANDING ───── */
 function showLandingError(msg) { document.getElementById('landing-error').textContent = msg; }
@@ -759,6 +847,35 @@ function handleMessage(msg) {
 
     case 'chat': addChat(msg); break;
     case 'reaction': spawnReaction(msg.emoji, msg.color); break;
+
+    case 'voice_existing_peers':
+      // We just joined voice; create outbound offers to everyone already in
+      msg.peers.forEach(p => createPeerConnection(p.userId, true));
+      break;
+
+    case 'voice_peer_joined':
+      // Someone new joined voice after us; wait for their offer (they initiate to existing peers... 
+      // but to be safe, also prepare a connection if we don't have one)
+      if (inVoice && !peerConnections[msg.userId]) {
+        // No-op: the new peer will send us an offer via voice_existing_peers logic on their end
+      }
+      break;
+
+    case 'voice_peer_left':
+      closePeerConnection(msg.userId);
+      break;
+
+    case 'voice_signal':
+      handleVoiceSignal(msg.fromId, msg.signal);
+      break;
+
+    case 'voice_state':
+      updateVoiceVisual(msg.userId, msg.inVoice, msg.muted);
+      break;
+
+    case 'voice_speaking':
+      setSpeakingVisual(msg.userId, msg.speaking);
+      break;
   }
 }
 
@@ -912,6 +1029,7 @@ function spawnReaction(emoji, color) {
 
 /* ───── PEOPLE ───── */
 function updatePeople(users) {
+  latestUsers = users;
   document.getElementById('watch-count').textContent = users.length;
   document.getElementById('people-tab-btn').textContent = `👥 People (${users.length})`;
   const list = document.getElementById('people-list');
@@ -919,14 +1037,34 @@ function updatePeople(users) {
   users.forEach(u => {
     const row = document.createElement('div');
     row.className = 'person-row';
+    row.id = `person-row-${u.id}`;
     const tags = [];
     if (u.isHost) tags.push('<span class="person-tag tag-host">Host</span>');
     if (u.id === myId) tags.push('<span class="person-tag tag-you">You</span>');
+    const micClass = u.inVoice ? (u.muted ? 'muted' : 'live') : '';
+    const micIcon = u.inVoice ? (u.muted ? '🔇' : '🎤') : '';
     row.innerHTML = `
       <div class="person-avatar" style="background:${u.color}">${u.name[0].toUpperCase()}</div>
       <span class="person-name">${esc(u.name)}</span>
+      ${micIcon ? `<span class="person-mic-icon ${micClass}">${micIcon}</span>` : ''}
       ${tags.join('')}`;
     list.appendChild(row);
+  });
+  renderVoiceStrip(users);
+}
+
+function renderVoiceStrip(users) {
+  const strip = document.getElementById('voice-strip');
+  strip.innerHTML = '';
+  users.filter(u => u.inVoice).forEach(u => {
+    const wrap = document.createElement('div');
+    wrap.className = 'voice-avatar-wrap' + (u.muted ? ' muted' : '');
+    wrap.id = `voice-avatar-${u.id}`;
+    wrap.innerHTML = `
+      <div class="voice-avatar" style="background:${u.color}">${u.name[0].toUpperCase()}</div>
+      <div class="voice-mute-badge">🔇</div>`;
+    wrap.title = u.name + (u.muted ? ' (muted)' : '');
+    strip.appendChild(wrap);
   });
 }
 
@@ -965,6 +1103,194 @@ function leaveRoom() {
 
 function esc(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ───── VOICE CHAT (WebRTC mesh) ───── */
+
+async function toggleVoice() {
+  if (!inVoice) {
+    await joinVoice();
+  } else {
+    toggleMute();
+  }
+}
+
+async function joinVoice() {
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  } catch (err) {
+    flashToast('🚫 Mic access denied');
+    return;
+  }
+  inVoice = true;
+  micMuted = false;
+  updateMicButton();
+  ws.send(JSON.stringify({ type: 'voice_join' }));
+  startSpeakingDetection();
+}
+
+function leaveVoice() {
+  inVoice = false;
+  ws.send(JSON.stringify({ type: 'voice_leave' }));
+  Object.keys(peerConnections).forEach(closePeerConnection);
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+  }
+  stopSpeakingDetection();
+  updateMicButton();
+}
+
+function toggleMute() {
+  if (!inVoice) return;
+  micMuted = !micMuted;
+  if (localStream) {
+    localStream.getAudioTracks().forEach(t => t.enabled = !micMuted);
+  }
+  ws.send(JSON.stringify({ type: 'voice_mute', muted: micMuted }));
+  updateMicButton();
+}
+
+document.getElementById('mic-btn')?.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  if (inVoice) leaveVoice();
+});
+
+function updateMicButton() {
+  const btn = document.getElementById('mic-btn');
+  if (!btn) return;
+  btn.classList.toggle('live', inVoice);
+  btn.classList.toggle('muted', inVoice && micMuted);
+  btn.textContent = !inVoice ? '🎤' : (micMuted ? '🔇' : '🎤');
+  btn.title = !inVoice
+    ? 'Join voice chat'
+    : (micMuted ? 'Click to unmute · right-click to leave' : 'Click to mute · right-click to leave');
+}
+
+function createPeerConnection(targetId, isInitiator) {
+  if (peerConnections[targetId]) return peerConnections[targetId];
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  peerConnections[targetId] = pc;
+
+  if (localStream) {
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+  }
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      ws.send(JSON.stringify({
+        type: 'voice_signal',
+        targetId,
+        signal: { kind: 'ice', candidate: e.candidate }
+      }));
+    }
+  };
+
+  pc.ontrack = (e) => {
+    let audio = remoteAudioEls[targetId];
+    if (!audio) {
+      audio = document.createElement('audio');
+      audio.autoplay = true;
+      audio.id = `voice-audio-${targetId}`;
+      document.body.appendChild(audio);
+      remoteAudioEls[targetId] = audio;
+    }
+    audio.srcObject = e.streams[0];
+  };
+
+  if (isInitiator) {
+    pc.onnegotiationneeded = async () => {
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({
+          type: 'voice_signal',
+          targetId,
+          signal: { kind: 'offer', sdp: pc.localDescription }
+        }));
+      } catch (err) {}
+    };
+  }
+
+  return pc;
+}
+
+async function handleVoiceSignal(fromId, signal) {
+  let pc = peerConnections[fromId];
+
+  if (signal.kind === 'offer') {
+    if (!pc) pc = createPeerConnection(fromId, false);
+    await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    ws.send(JSON.stringify({
+      type: 'voice_signal',
+      targetId: fromId,
+      signal: { kind: 'answer', sdp: pc.localDescription }
+    }));
+  } else if (signal.kind === 'answer') {
+    if (pc) await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+  } else if (signal.kind === 'ice') {
+    if (pc) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(signal.candidate)); } catch (e) {}
+    }
+  }
+}
+
+function closePeerConnection(userId) {
+  const pc = peerConnections[userId];
+  if (pc) { pc.close(); delete peerConnections[userId]; }
+  const audio = remoteAudioEls[userId];
+  if (audio) { audio.remove(); delete remoteAudioEls[userId]; }
+}
+
+function updateVoiceVisual(userId, userInVoice, muted) {
+  const u = latestUsers.find(x => x.id === userId);
+  if (u) { u.inVoice = userInVoice; u.muted = muted; }
+  updatePeople(latestUsers);
+}
+
+function setSpeakingVisual(userId, speaking) {
+  const wrap = document.getElementById(`voice-avatar-${userId}`);
+  if (wrap) wrap.classList.toggle('speaking', speaking);
+  const row = document.getElementById(`person-row-${userId}`);
+  if (row) row.classList.toggle('speaking', speaking);
+}
+
+function startSpeakingDetection() {
+  if (!localStream) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const source = audioCtx.createMediaStreamSource(localStream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+  source.connect(analyser);
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  let wasSpeaking = false;
+
+  speakingInterval = setInterval(() => {
+    if (!inVoice || micMuted) {
+      if (wasSpeaking) {
+        wasSpeaking = false;
+        ws.send(JSON.stringify({ type: 'voice_speaking', speaking: false }));
+        setSpeakingVisual(myId, false);
+      }
+      return;
+    }
+    analyser.getByteFrequencyData(data);
+    const avg = data.reduce((a, b) => a + b, 0) / data.length;
+    const speaking = avg > 12;
+    if (speaking !== wasSpeaking) {
+      wasSpeaking = speaking;
+      ws.send(JSON.stringify({ type: 'voice_speaking', speaking }));
+      setSpeakingVisual(myId, speaking);
+    }
+  }, 200);
+}
+
+function stopSpeakingDetection() {
+  if (speakingInterval) { clearInterval(speakingInterval); speakingInterval = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  analyser = null;
 }
 </script>
 </body>

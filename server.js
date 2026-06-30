@@ -35,7 +35,9 @@ function getRoomUsers(roomId) {
     id,
     name: u.name,
     color: u.color,
-    isHost: id === room.host
+    isHost: id === room.host,
+    inVoice: !!u.inVoice,
+    muted: u.muted !== false
   }));
 }
 
@@ -170,6 +172,68 @@ wss.on('connection', (ws) => {
         });
         break;
       }
+
+      // ── VOICE CHAT (WebRTC mesh signaling) ──
+
+      case 'voice_join': {
+        const room = rooms.get(ws.roomId);
+        if (!room) return;
+        const user = room.users.get(wsId);
+        if (!user) return;
+        user.inVoice = true;
+        user.muted = false;
+        // Tell everyone already in voice that a new peer joined (they'll initiate offers to it)
+        broadcast(ws.roomId, { type: 'voice_peer_joined', userId: wsId, name: user.name }, wsId);
+        // Tell the joiner who's already in voice (so it knows who to expect offers from)
+        const existingPeers = [...room.users.entries()]
+          .filter(([id, u]) => id !== wsId && u.inVoice)
+          .map(([id, u]) => ({ userId: id, name: u.name }));
+        ws.send(JSON.stringify({ type: 'voice_existing_peers', peers: existingPeers }));
+        broadcastAll(ws.roomId, { type: 'voice_state', userId: wsId, inVoice: true, muted: false });
+        break;
+      }
+
+      case 'voice_leave': {
+        const room = rooms.get(ws.roomId);
+        if (!room) return;
+        const user = room.users.get(wsId);
+        if (user) { user.inVoice = false; }
+        broadcastAll(ws.roomId, { type: 'voice_state', userId: wsId, inVoice: false, muted: true });
+        broadcast(ws.roomId, { type: 'voice_peer_left', userId: wsId }, wsId);
+        break;
+      }
+
+      case 'voice_mute': {
+        const room = rooms.get(ws.roomId);
+        if (!room) return;
+        const user = room.users.get(wsId);
+        if (!user) return;
+        user.muted = !!msg.muted;
+        broadcastAll(ws.roomId, { type: 'voice_state', userId: wsId, inVoice: !!user.inVoice, muted: user.muted });
+        break;
+      }
+
+      case 'voice_speaking': {
+        const room = rooms.get(ws.roomId);
+        if (!room) return;
+        broadcast(ws.roomId, { type: 'voice_speaking', userId: wsId, speaking: !!msg.speaking }, wsId);
+        break;
+      }
+
+      // WebRTC signaling relay: forward offer/answer/ice directly to the target peer
+      case 'voice_signal': {
+        const room = rooms.get(ws.roomId);
+        if (!room) return;
+        const target = room.users.get(msg.targetId);
+        if (target && target.ws.readyState === WebSocket.OPEN) {
+          target.ws.send(JSON.stringify({
+            type: 'voice_signal',
+            fromId: wsId,
+            signal: msg.signal
+          }));
+        }
+        break;
+      }
     }
   });
 
@@ -197,6 +261,10 @@ wss.on('connection', (ws) => {
       users: getRoomUsers(roomId),
       newHostId: room.host
     });
+
+    if (user?.inVoice) {
+      broadcast(roomId, { type: 'voice_peer_left', userId: wsId });
+    }
   });
 });
 
